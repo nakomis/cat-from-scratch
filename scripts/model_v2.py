@@ -46,21 +46,23 @@ class ResBlock(nn.Module):
 
 class CatCNNv2(nn.Module):
     """
-    Architecture overview (128×128 input):
+    Architecture overview (128×128 input, default in_channels=3):
 
-    Stem:    Conv(3→64, 3×3) → BN → ReLU                    → 128×128×64
+    Stem:    Conv(in_channels→64, 3×3) → BN → ReLU           → 128×128×64
     Stage 1: ResBlock(64→64)  × 2  + stride-2 ResBlock       →  64×64×64
     Stage 2: ResBlock(64→128) × 2  + stride-2 ResBlock       →  32×32×128
     Stage 3: ResBlock(128→256)× 2  + stride-2 ResBlock       →  16×16×256
     Stage 4: ResBlock(256→512)× 2  + stride-2 ResBlock       →   8×8×512
     GAP:     AdaptiveAvgPool(1×1) → Flatten                  →  512
     Head:    Dropout → Linear(512, num_classes)
+
+    Pass in_channels=4 to accept an extra trimap channel alongside RGB.
     """
-    def __init__(self, num_classes):
+    def __init__(self, num_classes, in_channels=3):
         super().__init__()
 
         self.stem = nn.Sequential(
-            nn.Conv2d(3, 64, 3, padding=1, bias=False),
+            nn.Conv2d(in_channels, 64, 3, padding=1, bias=False),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
         )
