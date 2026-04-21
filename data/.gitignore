@@ -1,6 +1,6 @@
-# Dataset archives and expanded directories — too large for git
+# Dataset archives and expanded directories — too large for plain git
+# bootboots-training-data.tar.gz is tracked via Git LFS (see .gitattributes)
 *.zip
-*.tar.gz
 *.tar
 oxford/
 PetImages/

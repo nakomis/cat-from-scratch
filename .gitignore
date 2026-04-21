@@ -21,11 +21,11 @@ logs/
 plots/
 
 # Datasets — see data/README.md for download instructions
+# bootboots-training-data.tar.gz is tracked via Git LFS (see .gitattributes)
 data/oxford/
 data/PetImages/
 data/kaggle_cats/
 data/*.zip
-data/*.tar.gz
 data/*.tar
 
 # macOS
