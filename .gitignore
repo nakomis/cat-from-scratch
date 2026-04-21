@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Trained model weights — large binary files
+models/
+*.pt
+*.pth
+*.onnx
+
+# Training logs and plots — regenerable
+logs/
+plots/
+
+# Datasets — see data/README.md for download instructions
+data/oxford/
+data/PetImages/
+data/kaggle_cats/
+data/*.zip
+data/*.tar.gz
+data/*.tar
+
+# macOS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+*.swp

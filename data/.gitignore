@@ -1,0 +1,7 @@
+# Dataset archives and expanded directories — too large for git
+*.zip
+*.tar.gz
+*.tar
+oxford/
+PetImages/
+kaggle_cats/
