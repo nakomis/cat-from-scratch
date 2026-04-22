@@ -28,6 +28,9 @@ data/kaggle_cats/
 data/*.zip
 data/*.tar
 
+# TLS certificates — never commit private keys
+certs/
+
 # macOS
 .DS_Store
 

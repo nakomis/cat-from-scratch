@@ -5,15 +5,17 @@ Local SAM 2 segmentation server for BootBoots cat annotation.
 Run once to download the checkpoint:
     python scripts/sam_server.py --download
 
-Then start the server:
+Then start the server (HTTP, for local dev):
     python scripts/sam_server.py
 
-The server listens on 0.0.0.0:7861 by default so it's reachable from other
-devices on the local network (iPad, etc.).
+With TLS (required when accessed from the deployed HTTPS sandbox site):
+    bash scripts/fetch_certs.sh          # copies certs from nasbox
+    python scripts/sam_server.py --tls
 
-NOTE: the sandbox app is served over HTTPS (CloudFront) but this server
-runs over plain HTTP. Chrome on the same machine (http://localhost:3000 dev
-server) works fine. For iPad access you'll want Tailscale — see the Trello card.
+The server listens on 0.0.0.0:7861.  With --tls it serves HTTPS so that
+sandbox.nakomis.com (CloudFront HTTPS) can call it without mixed-content errors.
+The certificate covers *.nasbox.nakomis.com; point phi.nasbox.nakomis.com at
+this machine's LAN IP (172.29.0.26) via a Route53 A record.
 """
 
 import argparse
@@ -27,7 +29,8 @@ import torch
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from PIL import Image
+from PIL import Image, ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True  # tolerate slightly corrupt S3 images
 from pydantic import BaseModel
 
 ROOT = Path(__file__).parent.parent
@@ -93,6 +96,7 @@ def make_trimap_overlay(mask: np.ndarray) -> Image.Image:
       - uncertain   → light slate grey (border region)
       - background  → semi-transparent grey
     """
+    mask = mask.astype(bool)
     dilated = _dilate(mask, UNCERTAIN_BORDER_PX)
     h, w = mask.shape
 
@@ -213,10 +217,20 @@ if __name__ == "__main__":
                         help="Download the SAM 2 checkpoint and exit")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=7861)
+    parser.add_argument("--tls", action="store_true",
+                        help="Serve over HTTPS using certs/fullchain.pem + certs/privkey.pem")
     args = parser.parse_args()
 
     if args.download:
         download_checkpoint()
     else:
         load_model()
-        uvicorn.run(app, host=args.host, port=args.port)
+        cert_dir = ROOT / "certs"
+        ssl_kwargs = {}
+        if args.tls:
+            ssl_kwargs = {
+                "ssl_certfile": str(cert_dir / "fullchain.pem"),
+                "ssl_keyfile":  str(cert_dir / "privkey.pem"),
+            }
+            print("TLS enabled — serving HTTPS")
+        uvicorn.run(app, host=args.host, port=args.port, **ssl_kwargs)
