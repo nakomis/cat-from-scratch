@@ -18,7 +18,37 @@ from torchvision import transforms
 from torchvision.datasets import ImageFolder
 from PIL import Image
 
+# Shared 4ch transform helpers (mirrors train_oxford_v2.py)
+_IMAGENET_MEAN = [0.485, 0.456, 0.406]
+_IMAGENET_STD  = [0.229, 0.224, 0.225]
+
 from model_v2 import CatCNNv2
+
+IMG_SIZE_CONST  = 128   # used by 4ch helpers before IMG_SIZE is defined below
+
+def _split_rgba_and_apply(rgba_img, rgb_xform, img_size):
+    r, g, b, a = rgba_img.split()
+    rgb = rgb_xform(Image.merge('RGB', (r, g, b)))
+    rgb_t   = transforms.Normalize(_IMAGENET_MEAN, _IMAGENET_STD)(transforms.ToTensor()(rgb))
+    alpha_t = transforms.ToTensor()(a)
+    return torch.cat([rgb_t, alpha_t], dim=0)   # (4, H, W)
+
+
+def train_transform_4ch(rgba_img):
+    rgba_img = transforms.RandomResizedCrop(IMG_SIZE_CONST, scale=(0.6, 1.0))(rgba_img)
+    rgba_img = transforms.RandomHorizontalFlip()(rgba_img)
+    rgba_img = transforms.RandomRotation(15)(rgba_img)
+    return _split_rgba_and_apply(
+        rgba_img,
+        transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.05),
+        IMG_SIZE_CONST,
+    )
+
+
+def val_transform_4ch(rgba_img):
+    rgba_img = transforms.Resize((IMG_SIZE_CONST, IMG_SIZE_CONST))(rgba_img)
+    return _split_rgba_and_apply(rgba_img, lambda x: x, IMG_SIZE_CONST)
+
 
 DATA_DIR        = os.path.expanduser("~/repos/nakomis/bootboots/local-training/data_multiclass")
 ROOT            = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -47,9 +77,11 @@ val_transforms = transforms.Compose([
 
 
 class BootBootsDataset(Dataset):
-    def __init__(self, samples, transform):
-        self.samples = samples
-        self.transform = transform
+    def __init__(self, samples, transform, use_trimap=False, train_mode=False):
+        self.samples    = samples
+        self.transform  = transform
+        self.use_trimap = use_trimap
+        self.train_mode = train_mode
 
     def __len__(self):
         return len(self.samples)
@@ -58,6 +90,12 @@ class BootBootsDataset(Dataset):
         path, label = self.samples[idx]
         try:
             img = Image.open(path).convert("RGB")
+            if self.use_trimap:
+                # BootBoots images have no trimap yet — use all-uncertain (0.5)
+                alpha = Image.new('L', img.size, 128)
+                rgba  = Image.merge('RGBA', (*img.split(), alpha))
+                xform = train_transform_4ch if self.train_mode else val_transform_4ch
+                return xform(rgba), label
             return self.transform(img), label
         except Exception:
             return None
@@ -101,12 +139,18 @@ if __name__ == "__main__":
                         help="Pretrained CatCNNv2 weights (default: best_oxford_v2.pt)")
     parser.add_argument("--frozen-epochs", type=int, default=FROZEN_EPOCHS)
     parser.add_argument("--full-epochs",   type=int, default=FULL_EPOCHS)
+    parser.add_argument("--use-trimap", action="store_true",
+                        help="Use a 4-channel model (trimap as 4th input channel)")
     args = parser.parse_args()
     setup_logging()
+
+    use_trimap = args.use_trimap
+    in_channels = 4 if use_trimap else 3
 
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     print(f"Using device: {device}")
     print(f"Backbone: {args.backbone}")
+    print(f"Trimap channel: {'on (4ch)' if use_trimap else 'off (3ch)'}")
 
     # --- Data ---
     train_folder = ImageFolder(os.path.join(DATA_DIR, "training"))
@@ -134,8 +178,10 @@ if __name__ == "__main__":
         n_val   = sum(1 for _, lbl in val_samples   if lbl == i)
         print(f"  {c}: {n_train} train, {n_val} val")
 
-    train_set = BootBootsDataset(train_samples, train_transforms)
-    val_set   = BootBootsDataset(val_samples,   val_transforms)
+    train_set = BootBootsDataset(train_samples, train_transforms,
+                                use_trimap=use_trimap, train_mode=True)
+    val_set   = BootBootsDataset(val_samples,   val_transforms,
+                                use_trimap=use_trimap, train_mode=False)
 
     train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True,
                               num_workers=4, collate_fn=collate_skip_none)
@@ -150,9 +196,20 @@ if __name__ == "__main__":
     criterion = nn.CrossEntropyLoss(weight=weights)
 
     # --- Model ---
-    # Load backbone trained on 12 Oxford breeds, swap head for 7 BootBoots classes
-    model = CatCNNv2(num_classes=12)
-    model.load_state_dict(torch.load(args.backbone, map_location="cpu"))
+    # Load backbone trained on Oxford breeds; detect whether it's 3ch or 4ch
+    # and zero-pad the stem if we're migrating from 3ch to 4ch.
+    ckpt = torch.load(args.backbone, map_location="cpu")
+    ckpt_ch = ckpt['stem.0.weight'].shape[1]
+    model = CatCNNv2(num_classes=12, in_channels=in_channels)
+    if ckpt_ch < in_channels:
+        old_w = ckpt['stem.0.weight']
+        new_w = torch.zeros(64, in_channels, 3, 3)
+        new_w[:, :ckpt_ch, :, :] = old_w
+        ckpt['stem.0.weight'] = new_w
+        print(f"  Padded stem from {ckpt_ch}→{in_channels} channels (new channel zero-initialised)")
+    elif ckpt_ch > in_channels:
+        raise ValueError(f"Backbone has {ckpt_ch} input channels but running in {in_channels}ch mode")
+    model.load_state_dict(ckpt)
     model.classifier = nn.Sequential(
         nn.Flatten(),
         nn.Dropout(0.4),
@@ -164,7 +221,8 @@ if __name__ == "__main__":
     print(f"\nParameters: {total_params:,}")
 
     best_val_acc = 0.0
-    save_path = os.path.join(ROOT, "models", "best_bootboots_v2.pt")
+    save_name = "best_bootboots_v2_4ch.pt" if use_trimap else "best_bootboots_v2.pt"
+    save_path = os.path.join(ROOT, "models", save_name)
 
     # -----------------------------------------------------------------------
     # Phase 1: freeze backbone, warm up the new head

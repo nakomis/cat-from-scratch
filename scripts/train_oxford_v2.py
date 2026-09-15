@@ -12,6 +12,7 @@ import os
 import re
 import sys
 import xml.etree.ElementTree as ET
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -24,6 +25,7 @@ from model_v2 import CatCNNv2, mixup_batch
 ROOT              = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OXFORD_IMAGES     = os.path.join(ROOT, "data", "oxford", "images")
 OXFORD_ANNOT      = os.path.join(ROOT, "data", "oxford", "annotations", "xmls")
+OXFORD_TRIMAPS    = os.path.join(ROOT, "data", "oxford", "annotations", "trimaps")
 IMG_SIZE          = 128
 BATCH_SIZE        = 64
 DEFAULT_EPOCHS    = 40
@@ -59,6 +61,64 @@ val_transforms = transforms.Compose([
 ])
 
 # ---------------------------------------------------------------------------
+# 4-channel (trimap) transforms — spatial applied to RGBA, colour to RGB only
+# ---------------------------------------------------------------------------
+
+_IMAGENET_MEAN = [0.485, 0.456, 0.406]
+_IMAGENET_STD  = [0.229, 0.224, 0.225]
+
+
+def _split_rgba_and_apply(rgba_img, rgb_xform):
+    r, g, b, a = rgba_img.split()
+    rgb = rgb_xform(Image.merge('RGB', (r, g, b)))
+    rgb_t   = transforms.Normalize(_IMAGENET_MEAN, _IMAGENET_STD)(transforms.ToTensor()(rgb))
+    alpha_t = transforms.ToTensor()(a)          # (1, H, W) ∈ [0, 1]
+    return torch.cat([rgb_t, alpha_t], dim=0)   # (4, H, W)
+
+
+def train_transform_4ch(rgba_img):
+    rgba_img = transforms.RandomResizedCrop(IMG_SIZE, scale=(0.6, 1.0))(rgba_img)
+    rgba_img = transforms.RandomHorizontalFlip()(rgba_img)
+    rgba_img = transforms.RandomRotation(15)(rgba_img)
+    return _split_rgba_and_apply(
+        rgba_img,
+        transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.05),
+    )
+
+
+def val_transform_4ch(rgba_img):
+    rgba_img = transforms.Resize((IMG_SIZE, IMG_SIZE))(rgba_img)
+    return _split_rgba_and_apply(rgba_img, lambda x: x)
+
+
+def load_trimap_alpha(stem):
+    """Load Oxford trimap PNG as an L-mode PIL image (0=background, 128=uncertain, 255=foreground).
+    Returns None if no trimap exists for this stem.
+    """
+    path = os.path.join(OXFORD_TRIMAPS, stem + ".png")
+    if not os.path.exists(path):
+        return None
+    arr = np.array(Image.open(path))
+    out = np.zeros(arr.shape, dtype=np.uint8)
+    out[arr == 1] = 255   # foreground
+    out[arr == 3] = 128   # uncertain border
+    # arr == 2 stays 0 (background)
+    return Image.fromarray(out, mode='L')
+
+
+def make_rgba(img, stem, use_trimap):
+    """Merge an RGB PIL image with a trimap alpha (or all-uncertain if unavailable)."""
+    if not use_trimap:
+        return img
+    alpha = load_trimap_alpha(stem) if stem else None
+    if alpha is None:
+        alpha = Image.new('L', img.size, 128)   # all-uncertain
+    elif alpha.size != img.size:
+        alpha = alpha.resize(img.size, Image.NEAREST)
+    return Image.merge('RGBA', (*img.split(), alpha))
+
+
+# ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
 
@@ -87,9 +147,11 @@ def crop_head(img, box, pad=HEAD_PAD):
 
 class CatBreedDataset(Dataset):
     """samples: list of (path, stem_or_None, label)"""
-    def __init__(self, samples, transform):
-        self.samples = samples
-        self.transform = transform
+    def __init__(self, samples, transform, use_trimap=False, train_mode=False):
+        self.samples    = samples
+        self.transform  = transform
+        self.use_trimap = use_trimap
+        self.train_mode = train_mode
 
     def __len__(self):
         return len(self.samples)
@@ -98,11 +160,21 @@ class CatBreedDataset(Dataset):
         path, stem, label = self.samples[idx]
         try:
             img = Image.open(path).convert("RGB")
-            if stem:
-                box = load_head_box(stem)
-                if box:
-                    img = crop_head(img, box)
-            return self.transform(img), label
+            if self.use_trimap:
+                # Build RGBA *before* cropping so trimap stays spatially aligned
+                rgba = make_rgba(img, stem, use_trimap=True)
+                if stem:
+                    box = load_head_box(stem)
+                    if box:
+                        rgba = crop_head(rgba, box)
+                xform = train_transform_4ch if self.train_mode else val_transform_4ch
+                return xform(rgba), label
+            else:
+                if stem:
+                    box = load_head_box(stem)
+                    if box:
+                        img = crop_head(img, box)
+                return self.transform(img), label
         except Exception:
             return None
 
@@ -198,6 +270,23 @@ def run_epoch(model, loader, criterion, optimiser, device, num_classes, train, u
     return total_loss / total, 100 * correct / total
 
 
+def load_checkpoint_4ch(path, model, device):
+    """Load a checkpoint that may be 3-channel into a model that may expect 4 channels.
+    If the stem weights have fewer input channels than the model, the extra channels
+    are zero-initialised so the model starts by ignoring them.
+    """
+    state = torch.load(path, map_location=device)
+    ckpt_ch = state['stem.0.weight'].shape[1]
+    model_ch = model.stem[0].weight.shape[1]
+    if ckpt_ch < model_ch:
+        old_w = state['stem.0.weight']           # (64, ckpt_ch, 3, 3)
+        new_w = torch.zeros(64, model_ch, 3, 3)
+        new_w[:, :ckpt_ch, :, :] = old_w
+        state['stem.0.weight'] = new_w
+        print(f"  Padded stem from {ckpt_ch}→{model_ch} channels (new channels zero-initialised)")
+    model.load_state_dict(state)
+
+
 if __name__ == "__main__":
     from logger import setup_logging
     parser = argparse.ArgumentParser()
@@ -206,15 +295,21 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
     parser.add_argument("--no-mixup", action="store_true")
     parser.add_argument("--resume", default=None,
-                        help="Path to checkpoint to resume from (e.g. best_oxford_v2.pt)")
+                        help="Path to checkpoint to resume from")
     parser.add_argument("--resume-epoch", type=int, default=0,
                         help="Epoch number the checkpoint was saved at (for scheduler state)")
+    parser.add_argument("--use-trimap", action="store_true",
+                        help="Use Oxford trimaps as a 4th input channel")
     args = parser.parse_args()
     setup_logging()
+
+    use_trimap = args.use_trimap
+    in_channels = 4 if use_trimap else 3
 
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     print(f"Using device: {device}")
     print(f"Cat breeds ({len(CAT_BREEDS)}): {CAT_BREEDS}")
+    print(f"Trimap channel: {'on (4ch)' if use_trimap else 'off (3ch)'}")
 
     breed_to_idx = {b: i for i, b in enumerate(CAT_BREEDS)}
 
@@ -246,15 +341,17 @@ if __name__ == "__main__":
         n = sum(1 for s in train_samples if s[2] == idx)
         print(f"  {breed}: {n} train")
 
-    train_set = CatBreedDataset(train_samples, train_transforms)
-    val_set   = CatBreedDataset(val_samples,   val_transforms)
+    train_set = CatBreedDataset(train_samples, train_transforms,
+                                use_trimap=use_trimap, train_mode=True)
+    val_set   = CatBreedDataset(val_samples,   val_transforms,
+                                use_trimap=use_trimap, train_mode=False)
 
     train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True,
                               num_workers=4, collate_fn=collate_skip_none)
     val_loader   = DataLoader(val_set,   batch_size=BATCH_SIZE, shuffle=False,
                               num_workers=4, collate_fn=collate_skip_none)
 
-    model = CatCNNv2(num_classes=len(CAT_BREEDS)).to(device)
+    model = CatCNNv2(num_classes=len(CAT_BREEDS), in_channels=in_channels).to(device)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"\nParameters: {total_params:,}")
 
@@ -265,7 +362,7 @@ if __name__ == "__main__":
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimiser, T_max=total_epochs)
 
     if args.resume:
-        model.load_state_dict(torch.load(args.resume, map_location=device))
+        load_checkpoint_4ch(args.resume, model, device)
         # Fast-forward the scheduler to where we left off
         for _ in range(args.resume_epoch):
             scheduler.step()
@@ -275,7 +372,8 @@ if __name__ == "__main__":
     print(f"Mixup: {'on' if use_mixup else 'off'}  Epochs: {args.epochs}  Total: {total_epochs}")
 
     best_val_acc = 0.0
-    save_path = os.path.join(ROOT, "models", "best_oxford_v2.pt")
+    save_name = "best_oxford_v2_4ch.pt" if use_trimap else "best_oxford_v2.pt"
+    save_path = os.path.join(ROOT, "models", save_name)
 
     for epoch in range(args.resume_epoch + 1, total_epochs + 1):
         train_loss, train_acc = run_epoch(model, train_loader, criterion, optimiser,
